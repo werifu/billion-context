@@ -52,7 +52,7 @@ import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { serveLaneTurn } from "./egress-lane-io.js";
+import { applyEgressAuthority, serveLaneTurn } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -291,6 +291,16 @@ export async function prepareAnthropic(
         // client must be told to send the full form again).
         if (msgidPinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && msgidPinMode !== null)) {
             msgidModeHeaders = { [MSGID_MODE_HEADER]: msgidPinMode };
+        }
+        // Ruling 7439-5 input authority seam (shared, lane-neutral —
+        // egress-lane-io.ts). This lane pins INLINE without the stage-0
+        // identity layer, so `pinned` is null until the owner rules its arm
+        // condition — the call is a no-op today and plumbs the seam so
+        // arming is a one-line change (never run on client bytes once armed).
+        const authority = applyEgressAuthority({ session, sessionId, core: msgs, pluginMode, isTitleGen: false, pinned: null, log });
+        if (authority.swapped) {
+            msgs = authority.core;
+            originalMessages = msgs;
         }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the

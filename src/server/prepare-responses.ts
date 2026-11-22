@@ -54,7 +54,7 @@ import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, 
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { rebuildLaneCore, recordLaneTurn } from "./egress-lane-io.js";
+import { applyEgressAuthority, rebuildLaneCore, recordLaneTurn } from "./egress-lane-io.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -300,6 +300,24 @@ export async function prepareResponses(
         // taken between the cursor write and the flush otherwise reads a
         // STALE parent revision and lands the child on the wrong lane.
         if (s0.anchorAdvanced) markDirty(session);
+        // Ruling 7439-5 input authority seam (shared, lane-neutral —
+        // egress-lane-io.ts, extracted from the OpenAI lane): once armed
+        // (feature ON + plugin + non-transient + pinned view) the server's
+        // egress op log is the session's content authority for good — hard-
+        // fail on an unreadable flow, bootstrap the client bytes exactly
+        // once on an empty flow, probe-gated canonical swap afterwards.
+        // The swapped `msgs` flows into processTurn below, so the turn's
+        // record (laneCore) carries the SAME canonical bytes.
+        const authority = applyEgressAuthority({ session, sessionId, core: msgs, pluginMode, isTitleGen: isCompactionTrigger, pinned: s0.pinned, log });
+        if (authority.swapped) {
+            msgs = authority.core;
+            originalMessages = msgs;
+        }
+        // Same rule as the OpenAI lane's record gate: an armed turn whose
+        // probe FAILED ran on client bytes — recording them would advance
+        // the flow with non-canonical content (the ruling forbids it). Skip
+        // the record; the turn re-attempts the swap next turn.
+        const egressRecordSkip = authority.armed && !authority.swapped && !authority.bootstrapping;
         // #7064 §8: the pin-mode signal (what the client may send NEXT
         // turn) rides this lane's response headers — the responses lane
         // has no watermark plane, so it is stamped independently of
@@ -541,7 +559,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // recorded nor served.
         let laneCore = processedMessages;
         const laneCoreForRecord = laneCore;
-        if (!isCompactionTrigger && featureEnabled("egressPlane")) {
+        if (!isCompactionTrigger && featureEnabled("egressPlane") && !egressRecordSkip) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 // Record FIRST with the lane's stable system text (the

@@ -51,7 +51,10 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
+import { recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
+import { applyEgressAuthority } from "./egress-lane-io.js";
+// Re-exported for tests: the probe now lives in the lane-neutral seam.
+export { egressAuthorityProbe } from "./egress-lane-io.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
 // Structural mirror of egress-record.ts's EgressSourceMsg (kept private
 // there by the unused-export gate): the recording seam only reads this shape.
@@ -61,54 +64,9 @@ interface EgressRecordSourceMsg {
     contentType?: unknown;
     text?: unknown;
 }
-import { rebuildCoreFromLog, rebuildOutboundFromLog } from "../storage/egress-serve.js";
+import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
-
-/** Ruling 7439-5 input probe (discussions/7439) — light per-turn identity
- * + byte SAMPLING on sampled rows only (never a full byte comparison).
- * Part 1 ORDER: every client id that exists in the server view must appear
- * in server-view order (append-only + client-side folding contract; a
- * reorder means the client is not echoing the server's conversation → the
- * turn degrades to legacy). Part 2 DIVERGENCE: up to 8 sampled rows compare
- * contentType + text length + (short, ≤32KB) exact text. A mismatch does NOT
- * fail the probe — the seam keeps server bytes regardless of what the client
- * sent; sampling only LOGS the divergence event (ruling: 记日志 + 警告,
- * 内容跟服务端, 出站自然收敛). */
-export function egressAuthorityProbe(
-    base: readonly BiliMessage[],
-    client: readonly BiliMessage[],
-    sessionId: string,
-    log: (level: string, msg: string) => void,
-): boolean {
-    const baseIndex = new Map<string, number>();
-    base.forEach((m, i) => {
-        if (!baseIndex.has(m.id)) baseIndex.set(m.id, i);
-    });
-    let cursor = -1;
-    for (const c of client) {
-        const i = baseIndex.get(c.id);
-        if (i === undefined) continue;
-        if (i <= cursor) return false;
-        cursor = i;
-    }
-    let diverged = 0;
-    const step = Math.max(1, Math.floor(client.length / 8));
-    for (let i = 0; i < client.length; i += step) {
-        const c = client[i];
-        const bi = baseIndex.get(c.id);
-        if (bi === undefined) continue;
-        const b = base[bi];
-        const ct = typeof c.text === "string" ? c.text : "";
-        const bt = typeof b.text === "string" ? b.text : "";
-        if (c.contentType !== b.contentType || ct.length !== bt.length || (ct.length <= 32768 && ct !== bt)) diverged++;
-        if (diverged >= 4) break;
-    }
-    if (diverged > 0) {
-        log("warn", `[${sessionId}] egress-authority divergence: ${diverged} sampled row(s) differ client-vs-server — server bytes win (client edits do not stick until the egress update API exists; discussions/7439 ruling 5)`);
-    }
-    return true;
-}
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -357,75 +315,32 @@ export async function prepareOpenai(
         if (s0.anchorAdvanced) markDirty(session);
         // Ruling 7439-5 (owner strategy decision, discussions/7439 §1) — the
         // server egress flow is the SOLE authority over conversation content.
-        // This is the ONE prepare-layer seam where the client's resend is
-        // demoted to what it is after turn 1: the identity/order channel (the
-        // probe below) and the byte source for NEW messages only. On a pinned
-        // plugin-lane turn with a live op-log flow, every EXISTING row below
-        // carries the bytes the SERVER recorded last turn; a client byte edit
-        // under a stable msgid is a divergence event (logged + warned), the
-        // server bytes win, and — because the outbound is served from the same
-        // log below — the client converges on its next echo. Legitimate client
-        // edits need the egress update API (follow-up, not in this PR). This
-        // OVERRIDES the pre-PR plugin-lane stance (snapshot-render.ts: "plugin
-        // lane: client-authoritative by design"). Scope is deliberately the
-        // PINNED plugin lane (both modes reasoned): bare proxy clients are
-        // tamper-evident by construction — their ids ARE content hashes, so a
-        // byte edit changes the id and already lands in the rewrite/drift
-        // gates — and proxy-lane kernel input must stay the RAW history (the
-        // kernel folds internally; a post-fold replay view would double-fold
-        // and trip #1001/#2432/#4521). The proxy lane gets ruling 5 on the
-        // EGRESS side (outbound served from the log); the pinned plugin lane
-        // gets it end-to-end (kernel input + outbound).
-        // Degrade (never guess, never client-as-authority): store missing or
-        // an unrebuildable view → the swap simply does not happen this turn
-        // (record still runs — see below — and the next turn re-attempts).
-        // Hard failure (ruling 7439-5's one non-negotiable): NO healthy flow
-        // point at all → the request fails, it does NOT run on client bytes
-        // (a divergent client being served as authority is the exact
-        // condition the ruling forbids); the marker latches for the operator
-        // and the client's retry hits the same error until recovery.
-        // Bootstrap: an armed turn with an EMPTY flow is the turn-1 cold start
-        // the ruling allows — the client bytes enter the flow exactly once
-        // (the record below), from turn 2 the log is the content source.
-        egressArmed = featureEnabled("egressPlane") && pluginMode && !isTitleGen && s0.pinned !== null;
-        if (egressArmed) {
-            // Ruling 7439: from this turn the op log is the content source of
-            // truth for the session, so the unified-storage verifier must not
-            // compare client-resend bytes against the canonical rows (that
-            // compare diverges BY DESIGN once the server serves canonical
-            // bytes the client never saw verbatim). The marker persists in
-            // session metadata (meta_json) so it survives restarts and covers
-            // every later turn, not just this one.
-            session.metadata["egressAuthority"] = true;
-            const st = getStore().egressOpLogStore();
-            if (st) {
-                const base0 = recoverEgressBase(st, sessionId);
-                if (base0 === null) {
-                    log("error", `[${sessionId}] egress-authority: no healthy flow point — refusing to run on client bytes (ruling 7439-5); latching egressFlowUnreadable, session-level recovery required`);
-                    session.metadata["egressFlowUnreadable"] = true;
-                    throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
-                }
-                egressBaseRows = base0.view;
-                if (base0.view.length === 0) {
-                    // Turn-1 cold start (ruling 7439-5): the client bytes are
-                    // the content source EXACTLY ONCE — the record below puts
-                    // them in the flow; from turn 2 this branch never runs
-                    // again for a healthy session.
-                    egressBootstrap = true;
-                    log("info", `[${sessionId}] egress-authority: bootstrap — empty flow, client bytes recorded once (turn 1 of the op-log)`);
-                } else {
-                    const base = rebuildCoreFromLog(base0.view) ?? [];
-                    if (base.length > 0 && egressAuthorityProbe(base, msgs, sessionId, log)) {
-                        const baseById = new Map(base.map((m) => [m.id, m] as const));
-                        msgs = msgs.map((c) => baseById.get(c.id) ?? c);
-                        originalMessages = msgs;
-                        egressSwapApplied = true;
-                        log("info", `[${sessionId}] egress-authority: ${base.length} existing row(s) served from the op-log, ${Math.max(0, msgs.length - base.length)} fresh from the client${base0.degraded ? ` (recovered to log_seq=${base0.seq}, truncated ${base0.truncated} row(s))` : ""}`);
-                    } else if (base.length > 0) {
-                        log("warn", `[${sessionId}] egress-authority: probe failed — flow NOT advanced this turn; legacy bytes served (re-attempts next turn)`);
-                    }
-                }
-            }
+        // This prepare-layer seam demotes the client's resend to what it is
+        // after turn 1: the identity/order channel (probe) and the byte
+        // source for NEW messages only; a client byte edit under a stable
+        // msgid is a divergence event — the server bytes win and the client
+        // converges on its next echo (legitimate edits need the egress update
+        // API, a follow-up). It OVERRIDES the pre-PR plugin-lane stance
+        // (snapshot-render.ts: "plugin lane: client-authoritative by design");
+        // scope is deliberately the PINNED plugin lane — proxy clients are
+        // tamper-evident by construction (ids ARE content hashes) and their
+        // kernel input must stay the RAW history (a post-fold replay view
+        // would double-fold and trip #1001/#2432/#4521). The mechanism lives
+        // in the shared lane-neutral seam (egress-lane-io.ts — the other
+        // lanes call the same function): hard-fail on an unreadable flow
+        // (never run on client bytes), bootstrap the client bytes exactly
+        // once on an empty flow, probe-gated canonical swap afterwards; the
+        // latch persists in session metadata across restarts.
+        const authority = applyEgressAuthority({ session, sessionId, core: msgs, pluginMode, isTitleGen, pinned: s0.pinned, log });
+        egressArmed = authority.armed;
+        if (authority.swapped) {
+            msgs = authority.core;
+            originalMessages = msgs;
+            egressSwapApplied = true;
+            egressBaseRows = authority.base;
+        } else if (authority.bootstrapping) {
+            egressBootstrap = true;
+            egressBaseRows = authority.base;
         }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity

@@ -186,6 +186,12 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_at          BIGINT NOT NULL,
     covered_hash        VARCHAR(64) NOT NULL,
     payload_json        LONGTEXT NOT NULL,
+    -- 7439 ruling 2: self-contained summary bytes + flow-coordinate
+    -- alignment (NULL: MySQL lane has no egress flow tables, and rows saved
+    -- before the switch keep NULL bytes — reads fall back to the CAS).
+    summary_bytes       BLOB NULL,
+    start_msgid         VARCHAR(255) NULL,
+    end_msgid           VARCHAR(255) NULL,
     PRIMARY KEY (session_id, block_id),
     KEY idx_blocks_session (session_id, ord),
     KEY idx_blocks_one_hash (one_hash),
@@ -420,6 +426,23 @@ export class MysqlBackend implements StorageBackend {
                 // (see migrateV8Identities) and either fully lands or resumes
                 // from the committed sessions on the next boot.
                 await this.migrateV8Identities();
+            }
+            // 7439 ruling 2: blocks self-containment columns — probe-first
+            // like the v8/v10/v11 additions (no stamp bump): every
+            // pre-existing table picks them up, fresh installs get them from
+            // the DDL. Runs on every boot, idempotent.
+            const [blockCols] = (await conn.query(
+                "SELECT COLUMN_NAME AS col FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'blocks'",
+            )) as unknown as Row[][];
+            const haveBlock = new Set((blockCols as unknown as { col?: unknown }[]).map((r) => String(r.col ?? "")));
+            if (!haveBlock.has("summary_bytes")) {
+                await conn.query("ALTER TABLE blocks ADD COLUMN summary_bytes BLOB NULL");
+            }
+            if (!haveBlock.has("start_msgid")) {
+                await conn.query("ALTER TABLE blocks ADD COLUMN start_msgid VARCHAR(255) NULL");
+            }
+            if (!haveBlock.has("end_msgid")) {
+                await conn.query("ALTER TABLE blocks ADD COLUMN end_msgid VARCHAR(255) NULL");
             }
             // Stamp advances but never downgrades: a future library stamped
             // higher than this build keeps its stamp.
@@ -846,11 +869,15 @@ export class MysqlBackend implements StorageBackend {
                 start_ref: number | null; end_ref: number | null; tier: number | string;
                 summary_hash: string | number; one_hash: string | null; supersedes_block_id: string | null;
                 active: number | string; created_at: number | string; covered_hash: string | number; payload_json: string | number;
+                // 7439 ruling 2 (NULL on pre-switch rows; msgid NULL on the
+                // MySQL lane — no egress flow tables).
+                summary_bytes: Buffer | null; start_msgid: string | null; end_msgid: string | null;
             };
             const storedBlocks = new Map<string, StoredBlockRow>();
             const storedBlockRows = (await c.query(
                 "SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, " +
-                "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json " +
+                "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json, " +
+                "summary_bytes, start_msgid, end_msgid " +
                 "FROM blocks WHERE session_id = ?",
                 [s.sessionId],
             )) as unknown as StoredBlockRow[][];
@@ -921,7 +948,11 @@ export class MysqlBackend implements StorageBackend {
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
-                // #5744 (mirror of store.ts): skip the whole write + CAS dance
+                // 7439 ruling 2: msgid coordinates are NULL on the MySQL lane
+                // (no egress flow tables); the stored value is preserved by
+                // the IF() guard below, so NULL incoming counts as unchanged.
+                const bStartMsgid: string | null = null;
+                const bEndMsgid: string | null = null;
                 // when the effective post-upsert row equals the stored row —
                 // steady-state saves re-send every block byte-identical. The
                 // -1/unknown bound keeps its stored value via the IF(>=0)
@@ -940,7 +971,14 @@ export class MysqlBackend implements StorageBackend {
                     num(ex.active) === (b.active ? 1 : 0) &&
                     num(ex.created_at) === b.createdAt &&
                     str(ex.covered_hash) === b.coveredHash &&
-                    str(ex.payload_json) === b.payloadJson) {
+                    str(ex.payload_json) === b.payloadJson &&
+                    // 7439 ruling 2: the upsert always lands b.summary inline
+                    // and NULL msgid (preserved); a pre-switch row (bytes
+                    // NULL) fails this once and is rewritten — the one-shot
+                    // backfill, mirror of store.ts.
+                    (ex.summary_bytes !== null && ex.summary_bytes !== undefined ? str(ex.summary_bytes) : null) === b.summary &&
+                    nullableStr(ex.start_msgid) === bStartMsgid &&
+                    nullableStr(ex.end_msgid) === bEndMsgid) {
                     continue;
                 }
                 const summaryHash = await this.putContent(c, b.summary, b.summaryHash);
@@ -956,8 +994,9 @@ export class MysqlBackend implements StorageBackend {
                 }
                 await c.query(
                     `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json,
+                       summary_bytes, start_msgid, end_msgid)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE
                        ord = VALUES(ord),
                        /* #4608: keep durable interval evidence when a later batch can no
@@ -970,7 +1009,10 @@ export class MysqlBackend implements StorageBackend {
                        summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
                        supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
                        created_at = VALUES(created_at), covered_hash = VALUES(covered_hash),
-                       payload_json = VALUES(payload_json)`,
+                       payload_json = VALUES(payload_json),
+                       summary_bytes = VALUES(summary_bytes),
+                       start_msgid = IF(VALUES(start_msgid) IS NOT NULL, VALUES(start_msgid), start_msgid),
+                       end_msgid = IF(VALUES(end_msgid) IS NOT NULL, VALUES(end_msgid), end_msgid)`,
                     [
                         b.blockId,
                         s.sessionId,
@@ -987,6 +1029,9 @@ export class MysqlBackend implements StorageBackend {
                         b.createdAt,
                         b.coveredHash,
                         b.payloadJson,
+                        b.summary,
+                        bStartMsgid,
+                        bEndMsgid,
                     ],
                 );
             }
@@ -1813,7 +1858,7 @@ export class MysqlBackend implements StorageBackend {
     private async getBlocksOn(conn: Pool | PoolConnection, sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         const [rows] = (await conn.query(
             `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
-                    supersedes_block_id, active, created_at, covered_hash, payload_json
+                    supersedes_block_id, active, created_at, covered_hash, payload_json, summary_bytes
              FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,
             [sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])],
         )) as unknown as Row[][];
@@ -1829,7 +1874,11 @@ export class MysqlBackend implements StorageBackend {
                 tier: num(r.tier),
                 summaryHash: str(r.summary_hash),
                 oneHash: nullableStr(r.one_hash),
-                summary: (await this.getContent(conn, str(r.summary_hash))) ?? "",
+                // 7439 ruling 2: prefer the self-contained inline bytes;
+                // the CAS fetch is the fallback for pre-switch rows.
+                summary: r.summary_bytes !== null && r.summary_bytes !== undefined
+                    ? Buffer.from(r.summary_bytes as Buffer).toString("utf8")
+                    : ((await this.getContent(conn, str(r.summary_hash))) ?? ""),
                 one: r.one_hash === null || r.one_hash === undefined ? null : ((await this.getContent(conn, str(r.one_hash))) ?? null),
                 supersedesBlockId: nullableStr(r.supersedes_block_id),
                 active: num(r.active) === 1,
@@ -2105,11 +2154,18 @@ export class MysqlBackend implements StorageBackend {
                 await c.query("INSERT IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)", [sessionId, mm.seq, mm.media_hash]);
             }
             for (const b of dump.blocks) {
+                // 7439 ruling 2: self-contained bytes from the dump's CAS map
+                // (older dumps lack the column); msgid NULL (not in the dump;
+                // no flow tables on this lane either).
                 await c.query(
                     `INSERT IGNORE INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier, b.summary_hash, b.one_hash ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json],
+                       summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json,
+                       summary_bytes, start_msgid, end_msgid)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier, b.summary_hash, b.one_hash ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json,
+                     typeof b.summary_bytes === "string" ? b.summary_bytes : (dump.content[b.summary_hash as string] ?? null),
+                     typeof b.start_msgid === "string" ? b.start_msgid : null,
+                     typeof b.end_msgid === "string" ? b.end_msgid : null],
                 );
             }
             for (const r of dump.refs) {

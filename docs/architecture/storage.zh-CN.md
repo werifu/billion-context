@@ -18,7 +18,7 @@
 
 ## 工作机制
 
-**写入侧。** ingest 路径批量写统一视图（稳定绝对 seq；内容哈希 id 走 `identityOfStoredContent`；边界帧 `boundaryMsgId` 随批落地）。`persist.ts` 管会话文件存盘/装载与 EPERM 告警层。内核经 StateStore 接口写压缩状态（blocks / refs / dead_refs / checkpoints）——接口由内核自带，宿主换实现。
+**写入侧。** ingest 路径批量写统一视图（稳定绝对 seq；内容哈希 id 走 `identityOfStoredContent`；边界帧 `boundaryMsgId` 随批落地）。`persist.ts` 管会话文件存盘/装载与 EPERM 告警层。内核经 StateStore 接口写压缩状态（blocks / refs / dead_refs / checkpoints）——接口由内核自带，宿主换实现。blocks 自包含（裁定 7439-2）：摘要正文在写入时内联到行（`summary_bytes`），msgid 坐标（`start_msgid`/`end_msgid`，egress 流水坐标空间——无流水会话为 NULL）在折叠时一次性钐定；读优先走行内字节，仅对迁移前旧行回退 content CAS 查（首次保存的一次性重写填列）。
 
 **kstate JSON 是平行的第二个真源（痛点 1）。** 存活 `CompressionState` 字段清单经 `mergeState()` 序列化（字段清单的单一事实源在 `src/state-hydration.ts`），与表并行读写——双通道。把内核态收敛进表是后续工作（#6858 将其列为 #6785 范围外）；#5874 v2 基座（内容 CAS、messages、refs、fold_journal、egress_snapshot）就是那次收敛落地的目标。
 
@@ -26,7 +26,7 @@
 
 **一致性。** 检查点帧签名 + S4 逐行校验和；判决只信链、不信内容相似。可选静态加密：AES-256-GCM（#708）+ zstd（#1080）。`src/storage/mysql.ts` 的 mysql 方言只是**测试镜像**（mysql-contract CI 车道）——生产存储永远是 SQLite。
 
-**egress 平面（KDD #22，#7398/#7439——出站会话 op log）。** `egress_state`/`egress_flow`（仅 SQLite 车道，gate `rollout.features.egressPlane`）存每个会话出站视图的稀疏 I/D/U op log；行自包含（字节随行走，不经内容 CAS）。两表均以 `(session_id, op_seq)` 为主键（append-only 行游标，恢复/截断键），I 行另带 `log_seq`——正史消息编号，永不重发。对 egress-on 会话，op log 是**唯一**正史消息权威：出站字节从它 serve，pin 通道解析它的 I 行而非 messages 账本，逐轮统一 ingest 停止（messages 降级为**惰性投影**，回滚/web 读/恢复时一次性重建），会话 JSON 信封在 bootstrap 冻结。恢复 = `recoverEgressBase`（有界 state 重放）；无健康点 ⇒ 整轮硬失败（裁定 7439-5），绝不降级到客户端字节。完整梳理：[PR #6785 文档 §6](../pr-6785-unified-storage-and-flows.zh-CN.md)。
+**egress 平面（KDD #22，#7398/#7439——出站会话 op log）。** `egress_state`/`egress_flow`（仅 SQLite 车道，gate `rollout.features.egressPlane`）存每个会话出站视图的稀疏 I/D/U op log；行自包含（字节随行走，不经内容 CAS）。两表均以 `(session_id, op_seq)` 为主键（append-only 行游标，恢复/截断键），I 行另带 `log_seq`——正史消息编号，永不重发。对 egress-on 会话，op log 是**唯一**正史消息权威：出站字节从它 serve，pin 通道解析它的 I 行而非 messages 账本，逐轮统一 ingest 停止（messages 降级为**惰性投影**，回滚/web 读/恢复时一次性重建），会话 JSON 信封在 bootstrap 冻结。恢复 = `recoverEgressBase`（有界 state 重放）；无健康点 ⇒ 整轮硬失败（裁定 7439-5），绝不降级到客户端字节。输入权威缝是车道无关的（`src/server/egress-lane-io.ts` 的 `applyEgressAuthority`）：OpenAI 与 responses 车道在 stage-0 pinned 视图上 arm；anthropic 与 google 车道以 null pin 调用（内联 pin，无 stage-0 身份层——arm 它们是等 owner 裁定后的一行改动）。完整梳理：[PR #6785 文档 §6](../pr-6785-unified-storage-and-flows.zh-CN.md)。
 
 ## 硬不变量（动手前先读 AGENTS.md）
 

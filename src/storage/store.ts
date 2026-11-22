@@ -1562,12 +1562,16 @@ export class UnifiedStore {
                 start_ref: number | null; end_ref: number | null; tier: number;
                 summary_hash: string; one_hash: string | null; supersedes_block_id: string | null;
                 active: number; created_at: number; covered_hash: string; payload_json: string;
+                // 7439 ruling 2: self-contained bytes + flow-coordinate alignment
+                // (probe-first columns; NULL on rows saved before the switch).
+                summary_bytes: string | null; start_msgid: string | null; end_msgid: string | null;
             };
             const storedBlocks = new Map<string, StoredBlockRow>();
             for (const row of this.db
                 .prepare(
                     "SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, " +
-                    "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json " +
+                    "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json, " +
+                    "summary_bytes, start_msgid, end_msgid " +
                     "FROM blocks WHERE session_id = ?",
                 )
                 .all(s.sessionId) as StoredBlockRow[]) {
@@ -1654,10 +1658,34 @@ export class UnifiedStore {
                 } catch { /* malformed payload: keep the no-claim sentinel */ }
                 return hi < 0 ? [-1, -1] : [lo, hi];
             };
+            // 7439 ruling 2: on an egress-on session the live msgid view
+            // (egress_state I-row order) IS the conversation order and the
+            // block's covered ids sit in that same space, so min/max covered
+            // position resolves to start/end_msgid at ingest time — zero joins
+            // later. Non-egress sessions have no flow table: the columns stay
+            // NULL and the upsert below preserves the stored value.
+            const egressOrder = this.snapEgressPinLiveIds(s.sessionId);
+            const egressPos = new Map(egressOrder.map((m, i) => [m, i] as const));
+            const msgidBoundsForCovered = (payloadJson: string): [string | null, string | null] => {
+                if (egressOrder.length === 0) return [null, null];
+                let lo = Number.POSITIVE_INFINITY;
+                let hi = -1;
+                try {
+                    const cov = JSON.parse(payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) {
+                        const p = egressPos.get(id);
+                        if (p === undefined) continue;
+                        if (p < lo) lo = p;
+                        if (p > hi) hi = p;
+                    }
+                } catch { /* malformed payload: keep the no-claim nulls */ }
+                return hi < 0 ? [null, null] : [egressOrder[lo], egressOrder[hi]];
+            };
             const blocksUpsert = this.db.prepare(
                 `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                   summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json,
+                   summary_bytes, start_msgid, end_msgid)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(session_id, block_id) DO UPDATE SET
                    ord = excluded.ord,
                    start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
@@ -1666,11 +1694,18 @@ export class UnifiedStore {
                    summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
                    supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
                    created_at = excluded.created_at, covered_hash = excluded.covered_hash,
-                   payload_json = excluded.payload_json`,
+                   payload_json = excluded.payload_json,
+                   /* 7439 ruling 2: incoming NULL msgid = non-egress session
+                      (no flow coordinates exist) — keep the stored value; on an
+                      egress-on session a NULL intersection honestly clears. */
+                   summary_bytes = excluded.summary_bytes,
+                   start_msgid = CASE WHEN excluded.start_msgid IS NOT NULL THEN excluded.start_msgid ELSE blocks.start_msgid END,
+                   end_msgid = CASE WHEN excluded.end_msgid IS NOT NULL THEN excluded.end_msgid ELSE blocks.end_msgid END`,
             );
             for (const b of input.blocks) {
                 if (skipIncomingBlocks) continue;
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
+                const [bStartMsgid, bEndMsgid] = msgidBoundsForCovered(b.payloadJson);
                 // #5744: steady-state saves re-send every block byte-identical.
                 // When the effective post-upsert row equals the stored row the
                 // whole write (and its CAS bump/release dance, which nets to
@@ -1691,7 +1726,15 @@ export class UnifiedStore {
                     ex.active === (b.active ? 1 : 0) &&
                     ex.created_at === b.createdAt &&
                     ex.covered_hash === b.coveredHash &&
-                    ex.payload_json === b.payloadJson) {
+                    ex.payload_json === b.payloadJson &&
+                    // 7439 ruling 2: the upsert always lands b.summary inline
+                    // and the msgid bounds (NULL-preserved on non-egress, so a
+                    // NULL incoming equals a NULL stored); a pre-switch stored
+                    // row (bytes NULL) fails this once and is rewritten — that
+                    // is the natural one-shot backfill, no separate path.
+                    ex.summary_bytes === b.summary &&
+                    (ex.start_msgid ?? null) === bStartMsgid &&
+                    (ex.end_msgid ?? null) === bEndMsgid) {
                     continue;
                 }
                 const summaryHash = this.putContent(b.summary, b.summaryHash);
@@ -1730,6 +1773,9 @@ export class UnifiedStore {
                     b.createdAt,
                     b.coveredHash,
                     b.payloadJson,
+                    b.summary,
+                    bStartMsgid,
+                    bEndMsgid,
                 );
                 if (ex) {
                     if (ex.summary_hash === summaryHash) this.releaseContent(summaryHash);
@@ -2988,9 +3034,20 @@ export class UnifiedStore {
             }
             const insMedia = this.db.prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) insMedia.run(sessionId, mm.seq, mm.media_hash);
-            const insBlock = this.db.prepare(`INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`);
-            for (const b of dump.blocks) insBlock.run(b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier, b.summary_hash, b.one_hash ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json);
+            // 7439 ruling 2: restore lands the self-contained bytes from the
+            // dump's CAS map (older dumps lack the column → fall back to the
+            // hash, which the reference pass above always restored). msgid
+            // coordinates are NOT in a v1 dump (egress tables don't ride it)
+            // — NULL; the next ingest recomputes them from the live flow.
+            const insBlock = this.db.prepare(`INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json, summary_bytes, start_msgid, end_msgid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`);
+            for (const b of dump.blocks) insBlock.run(
+                b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier,
+                b.summary_hash, b.one_hash ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json,
+                typeof b.summary_bytes === "string" ? b.summary_bytes : (dump.content[b.summary_hash as string] ?? null),
+                typeof b.start_msgid === "string" ? b.start_msgid : null,
+                typeof b.end_msgid === "string" ? b.end_msgid : null,
+            );
             const insRef = this.db.prepare("INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?)");
             for (const r of dump.refs) insRef.run(sessionId, r.ord, r.raw_id, r.ref, r.ref_num ?? null);
             const insDead = this.db.prepare("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)");
@@ -3126,14 +3183,21 @@ export class UnifiedStore {
                 if (body === undefined) throw new Error(`archive content missing: ${hash}`);
                 this.putContent(body, hash);
             }
+            // 7439 ruling 2: self-contained bytes from the dump's CAS map
+            // (present for every dump whose content map is verified above);
+            // msgid coordinates stay NULL (not in the dump; recomputed at
+            // the next ingest).
             this.db.prepare(
-                `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`,
+                `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json, summary_bytes, start_msgid, end_msgid)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`,
             ).run(
                 dump.block.block_id as string, sessionId, dump.block.ord as number, dump.block.start_seq as number, dump.block.end_seq as number,
                 (dump.block.start_ref as number | null) ?? null, (dump.block.end_ref as number | null) ?? null, dump.block.tier as number,
                 dump.block.summary_hash as string, (dump.block.one_hash as string | null) ?? null, (dump.block.supersedes_block_id as string | null) ?? null,
                 dump.block.active as number, dump.block.created_at as number, dump.block.covered_hash as string, dump.block.payload_json as string,
+                typeof dump.block.summary_bytes === "string" ? dump.block.summary_bytes : dump.content[dump.block.summary_hash as string] ?? null,
+                typeof dump.block.start_msgid === "string" ? dump.block.start_msgid : null,
+                typeof dump.block.end_msgid === "string" ? dump.block.end_msgid : null,
             );
         });
         const kept: string[] = [];
@@ -3766,8 +3830,10 @@ export class UnifiedStore {
      *  decoding (storage-bounded-load / issue4739-storage-read-snapshot pin
      *  this shape). */
     getBlockContents(sessionId: string, opts: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] {
-        const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, s.bytes AS summary_bytes, o.bytes AS one_bytes
-            FROM (SELECT block_id, ord, summary_hash, one_hash FROM blocks
+        // 7439 ruling 2: prefer the self-contained inline bytes; the CAS JOIN
+        // is the fallback for pre-switch rows (summary_bytes NULL).
+        const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, COALESCE(b.summary_bytes, s.bytes) AS summary_bytes, o.bytes AS one_bytes
+            FROM (SELECT block_id, ord, summary_hash, one_hash, summary_bytes FROM blocks
                 WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?) b
             LEFT JOIN content s ON s.hash = b.summary_hash
             LEFT JOIN content o ON o.hash = b.one_hash
@@ -4124,9 +4190,9 @@ export class UnifiedStore {
             .prepare(
                 `SELECT b.block_id, b.ord, b.start_seq, b.end_seq, b.start_ref, b.end_ref, b.tier, b.summary_hash, b.one_hash,
                         b.supersedes_block_id, b.active, b.created_at, b.covered_hash, b.payload_json,
-                        s.bytes AS summary_bytes, o.bytes AS one_bytes
+                        COALESCE(b.summary_bytes, s.bytes) AS summary_bytes, o.bytes AS one_bytes
                  FROM (SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
-                              supersedes_block_id, active, created_at, covered_hash, payload_json
+                              supersedes_block_id, active, created_at, covered_hash, payload_json, summary_bytes
                        FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}) b
                  LEFT JOIN content s ON s.hash = b.summary_hash
                  LEFT JOIN content o ON o.hash = b.one_hash

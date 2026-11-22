@@ -43,7 +43,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { serveLaneTurn } from "./egress-lane-io.js";
+import { applyEgressAuthority, serveLaneTurn } from "./egress-lane-io.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -170,6 +170,16 @@ export async function prepareGoogle(
             } else {
                 log("info", `[${sessionId}] [msgid] google-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#6525)`);
             }
+        }
+        // Ruling 7439-5 input authority seam (shared, lane-neutral —
+        // egress-lane-io.ts). This lane pins INLINE without the stage-0
+        // identity layer, so `pinned` is null until the owner rules its arm
+        // condition — the call is a no-op today and plumbs the seam so
+        // arming is a one-line change (never run on client bytes once armed).
+        const authority = applyEgressAuthority({ session, sessionId, core: msgs, pluginMode, isTitleGen, pinned: null, log });
+        if (authority.swapped) {
+            msgs = authority.core;
+            originalMessages = msgs;
         }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
