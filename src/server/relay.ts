@@ -48,7 +48,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { estimateCoreMessages } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -77,7 +77,7 @@ import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 
 /** Retry the same input when the provider proved only its output reservation overflows. */
 function capOverflowOutput(body: string | Buffer, info: ContextOverflowInfo): { body: string; cap: number } | null {
@@ -998,33 +998,17 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         const declaredWindow = typeof prepared.session.metadata.effectiveContextLimit === "number" && prepared.session.metadata.effectiveContextLimit > 0
             ? prepared.session.metadata.effectiveContextLimit
             : 0;
-        // #4079: the declared window can be wrong SMALL (stale config, registry
-        // miss, #3993-style catalog fallback) — never size the catastrophic bar
-        // below the largest common window, or the fuse false-blocks bodies the
-        // real upstream accepts.
-        const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
-            // #5000/#4543: the byte floor below prices only m.text — a body whose
-            // mass sits in tools[] / tool arguments / the system prompt clears it
-            // (incident #5000: a 55.2 MiB wire body whose core text cleared the
-            // floor; #4543: a 4.1 MiB CJK body measuring ~1.12M tokens that the
-            // 7.5 B/tok floor cannot see below ~8.4 MB). Price the ACTUAL
-            // outbound body first with the #554 side-request meter (every string
-            // field, CJK-aware) and judge it against the SAME floored bar the
-            // byte floor uses (fuseWindow): the fuse's #4079 contract is
-            // "never block what a largest-common-window upstream might accept",
-            // and that contract binds a measurement just as much as a density
-            // guess — a wrong-small declaration must not false-block a body a
-            // 1M window would take. #4543 still lands: its declared 1,048,580
-            // window sits ABOVE the 1M floor, so floored or not the 1.12M-token
-            // body exceeds it. The byte floor stays as the fallback for
-            // unparseable bodies. No refusal record either way (#3974).
             // #5000 item 2: the COUNT dimension — no window, tokenizer, or byte
             // floor sees the messages[] array length (the 26,903-message #5000
             // session cleared every size gate and died at the upstream). Same
             // per-upstream opt-in as preflight (BILI_MAX_MESSAGES); the fuse is
             // the last line for the no-model lane where preflight never ran.
+            // #7537: the measured-body and byte-floor 413 rejections were
+            // removed — after folding, the payload is ALWAYS forwarded and the
+            // upstream's real size error is the authoritative verdict. Only the
+            // exact count gate (messages[] wire limit) remains.
             const fuseMaxMessages = limitsMaxMessages();
             if (fuseMaxMessages > 0 && fuseMsgs.length > fuseMaxMessages) {
                 const countMessage = `message count ${fuseMsgs.length.toLocaleString("en-US")} exceeds the upstream wire limit ${fuseMaxMessages.toLocaleString("en-US")} (COUNT dimension — a hard upstream constraint on the messages[] array that no byte/token estimate expresses, #5000); the send was stopped at the egress fuse instead of being forwarded. Reduce the session history — restart the session or rewind to an earlier point — and retry.`;
@@ -1033,32 +1017,6 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 else {
                     res.writeHead(413, { "content-type": "application/json" });
                     res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: countMessage, retryable: false } }));
-                }
-                return;
-            }
-            const fuseMeasured = measuredOutbound(prepared);
-            const fuseRawTokens = fuseMeasured?.tokens;
-            if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
-                log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
-                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
-                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
-                else {
-                    res.writeHead(413, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
-                }
-                return;
-            }
-            const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
-            if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-                const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-                log("warn", `413: [${prepared.session.id}] egress window fuse core-text profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
-                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
-                else {
-                    res.writeHead(413, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
                 }
                 return;
             }
@@ -2195,6 +2153,19 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // would leave the client on a broken response.
         delete errHeaders["content-length"];
         delete errHeaders["transfer-encoding"];
+        // #7537: mark upstream size errors (413 / 400-context-overflow) as
+        // non-retryable so host clients do not retry the identical over-window
+        // payload and burn rate limit. The body is relayed byte-exact (wire
+        // fidelity); this header is additive and carries no body mutation.
+        {
+            const errBodyText = typeof errBody === "string" ? errBody : "";
+            const ovf = inspectContextOverflow(upstream.status, errBodyText);
+            const isSizeError = ovf.isOverflow || isMarkerlessOverflowReject(upstream.status, errBodyText);
+            if (isSizeError) {
+                errHeaders["x-bili-retryable"] = "false";
+                log("warn", `[${errSid}] upstream size error ${upstream.status} relayed with x-bili-retryable:false (#7537); provider evidence: ${ovf.message || "(no body)"}`);
+            }
+        }
         res.writeHead(upstream.status, errHeaders);
         res.end(errBody ?? undefined);
         clearUpstreamTimer();

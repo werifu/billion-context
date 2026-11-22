@@ -70,7 +70,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -2803,31 +2803,12 @@ async function handleRequest(
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
             // hammering the upstream). Gate on the raw body estimate and fail
             // fast locally instead of forwarding (#301 precedent).
-            const reqModel = requestModel;
-            // #1110: only a genuine overflow arm bounds the guard — never the
-            // nudge baseline (lastInputTokens). A healthy compressed host turn
-            // keeps that baseline low, which permanently 413'd an unrelated
-            // in-process caller's fixed-size request even though it fit the
-            // model's real window. overflowArmTokens is set ONLY by an upstream
-            // context-overflow 400 and cleared by the next real usage report.
-            const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin), shouldReserveOutputHeadroom(protocol, normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin), requestModel));
-            if (guard.blocked) {
-                log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
-                if (!res.headersSent && !res.writableEnded && !res.destroyed) {
-                    res.writeHead(413, { "content-type": "application/json" });
-                    res.end(JSON.stringify({
-                        error: {
-                            type: "server_error",
-                            code: "side_request_payload_too_large",
-                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
-                            retryable: false,
-                        },
-                    }));
-                }
-                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
-                return;
-            }
+            // #7537: the side-request local-estimation 413 guard was removed —
+            // after folding, the payload is ALWAYS forwarded and the upstream's
+            // real size error is the authoritative verdict. Side requests bypass
+            // preflight by design (#388); instead of a local estimate, the
+            // upstream now returns the real size error (with the provider's own
+            // numbers), which is the authoritative verdict.
             const sideReason = sideLane.reason;
             log("info", `[${session.id}] side request (${sideReason}) → passthrough + tag strip only, kernel state untouched`);
             // #1897: a demoted request was mutated (tools stripped) — re-serialize

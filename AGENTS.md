@@ -61,6 +61,10 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 
 身份信号来源只有三类：**宿主写入**（msgid body 字段 / 信封 `msgIds` / pf 头）、**宿主盖戳头**（opencode V2 `x-bili-msg-ids`）、**自包含采集器**（`src/identity-harvest.ts` 注册表 + `src/identity-<client>.ts` 适配器；双门：env `BILI_IDENTITY_HARVEST` 或灰度键 `rollout.features.identityChannelHarvest`，均默认关 × 仅回环来源）。**消费者（#5719 归属档 / pin-行链路 / membership / 水位）只从统一缝取数**：handle 入口每请求按「body 字段 > 盖戳头 > 采集」取一次快照——绝不新增「逐调用点单独取数」。新车道 = 新适配器文件 + barrel 一行登记 + 文档一行；适配器自包含、整轮退化（任一环节不判定 ⇒ 该轮整体回退接线前路径，绝不做部分映射）。车道状态表与信任边界：docs/identity-channels.md；身份判定逻辑：docs/session-identity-resolution.md。Full text: design-decisions.md #18.
 
+### #20 — Preflight 不用本地估算拒发：折叠后一律转发，超窗让上游自己说 (#7537) (Tier B)
+
+**取消所有基于本地估算的 413 拒发。** 原则：(1) 超窗 → 先折叠（折叠机制不动）；(2) 折叠完不再判死刑，一律转发；(3) 真超窗时让上游返回真实错误（带 provider 自己的真实数字），bili 原样透传 + 日志附本地实测证据（inboundBytes、折叠后 measured tokens、窗口值、折叠轮数）；(4) 上游尺寸类错误（413/400-size）透传时标记 `x-bili-retryable: false`，防止宿主客户端把它当可重试错误反复重发烧 rate limit；(5) **保留**计数门（messages[] 条数超上游 wire 硬限制）——那是精确约束不是估算；(6) 保留 identity fast path（#7532）。**禁止未来 agent 再发明估算拒发门**（#2490/#2847/#3146/#4185/#3846 家族总根因）。Full text: design-decisions.md #20.
+
 ### Install-Lane & Update-Ownership Contract (#1196)
 
 Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:

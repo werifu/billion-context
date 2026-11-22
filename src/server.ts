@@ -86,7 +86,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -3327,14 +3327,8 @@ export function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outc
 // 30s protects every client whose header deadline exceeds 30s (undici's 300s
 // default included); shorter preflights keep full status-code fidelity.
 const PREFLIGHT_KEEPALIVE_MS = 15_000;
-// #2490/#3146: mathematically-doomed forward guard, priced in UTF-8 BYTES of the
-// core text against two bars — window×7.5 (densest live-route billing observed,
-// ~6.8 B/token, #2122) AND an absolute 2MB floor. Module-scoped so both the
-// estimate-only probe (#2313) and the fresh-session forward-once (#3146) share
-// the exact same doom math. Exported for the relay egress fuse (#4079) — the
-// same "no tokenizer at the densest observed density can fit this" bars.
-export const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
-export const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
+// #7537: the DOOMED_PROBE_* byte-floor constants were removed — local
+// estimation-based 413 rejections no longer exist.
 
 function preflightHoldGraceMs(): number {
     return knobPreflightHoldGraceMs();
@@ -3345,78 +3339,9 @@ function preflightHoldGraceMs(): number {
 // (#4079) the #726 dead-end COOLDOWN was removed entirely — its knob and
 // config key with it.
 
-// #3846: a local 413 ("can never fit, NOT forwarded") is independent evidence
-// that this origin/model/window cannot accept the payload — but it only ever
-// lived in the #726 dead-end marker's body-hash dimension: the moment the
-// baseline source demotes to estimate (the #2313 probe re-arms at
-// baselineFloor === 0) or the body changes between turns (the hash misses),
-// the refusal evaporates and every forward-once escape hatch (estimate-only
-// probe / image arbitration / #1839 rebuilt-view divergence / #3146
-// fresh-session) re-bets the same estimator guess — production shape: three
-// consecutive full-bill forwards of 606K/620K/633K-token payloads bili itself
-// had already refused locally. Persist refusals as their own metadata channel
-// — NEVER as usage (that field is upstream billing evidence only) — scoped to
-// the route/model/window that saw them; an equal-or-wider refused window
-// covers the current equal-or-tighter one, anything else evaluates fresh.
-interface LocalRefusalRecord {
-    origin: string;
-    model: string;
-    window: number;
-    at: number;
-}
-
-const LOCAL_REFUSAL_MAX_RECORDS = 16;
-
-/** (#3974/#4079) a local refusal is route-scoped CIRCUMSTANTIAL evidence, not
- *  a permanent property of the model: windows get re-declared (config fix,
- *  catalog refresh, #3993-style fallback recovery), payloads shrink, and an
- *  unexpiring record locked new sessions out of every forward-once escape
- *  hatch forever. Ten minutes covers the aggressive host-retry window the
- *  record exists for (#3846's consecutive full-bill re-sends) while
- *  guaranteeing the lock self-heals without any user action. */
-const LOCAL_REFUSAL_TTL_MS = 10 * 60_000;
-
-function readLocalRefusals(metadata: Record<string, unknown>): LocalRefusalRecord[] {
-    const raw = metadata.localRefusals;
-    if (!Array.isArray(raw)) return [];
-    const now = Date.now();
-    return raw.filter((r): r is LocalRefusalRecord =>
-        !!r && typeof r === "object"
-        && typeof (r as LocalRefusalRecord).origin === "string"
-        && typeof (r as LocalRefusalRecord).model === "string"
-        && typeof (r as LocalRefusalRecord).window === "number"
-        // (#4079/#3974) a record without a readable timestamp is treated as
-        // expired too — sessions persisted before the TTL carried no `at`, and
-        // those are exactly the ones stuck in the never-expiring lock.
-        && typeof (r as LocalRefusalRecord).at === "number"
-        && (r as LocalRefusalRecord).at > now - LOCAL_REFUSAL_TTL_MS,
-    );
-}
-
-/** Record a local 413 refusal for (origin, model, window). A wider refusal in
- *  the same scope already dominates (it covers every tighter window); a
- *  narrower one replaces it so the record tracks the widest verdict seen. */
-function noteLocalRefusal(session: Session, origin: string | undefined, model: string | undefined, window: number): void {
-    if (!origin || !model || !Number.isFinite(window) || window <= 0) return;
-    const records = readLocalRefusals(session.metadata);
-    const existing = records.find((r) => r.origin === origin && r.model === model);
-    if (existing !== undefined && existing.window >= window) return;
-    session.metadata.localRefusals = [
-        ...records.filter((r) => !(r.origin === origin && r.model === model)),
-        { origin, model, window: Math.floor(window), at: Date.now() },
-    ].slice(-LOCAL_REFUSAL_MAX_RECORDS);
-    markDirty(session);
-}
-
-/** True when this session was locally refused (413) by the SAME origin+model
- *  at an equal or WIDER window — the current request may then not reopen any
- *  forward-once escape hatch (#3846). Both sides must be known
- *  (evidence-permitlist discipline: an unprovenanced refusal proves nothing
- *  about an unprovenanced request, and vice versa). */
-function localRefusalCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, window: number): boolean {
-    if (!origin || !model) return false;
-    return readLocalRefusals(metadata).some((r) => r.origin === origin && r.model === model && r.window >= window);
-}
+// #7537: the #3846 local-refusal memory (LocalRefusalRecord / readLocalRefusals /
+// noteLocalRefusal / localRefusalCovers) was removed — local 413 rejections no
+// longer exist, so there is nothing to remember.
 
 /** #568: commit the response early so a long preflight cannot lose the client
  *  to its header timeout. Streaming clients get an SSE stream with keep-alive
@@ -4025,18 +3950,10 @@ export async function preflightCompressIfNeeded(
             const gap = msgCount - maxMessages;
             const countMessage = `message count ${msgCount.toLocaleString("en-US")} exceeds the upstream wire limit ${maxMessages.toLocaleString("en-US")} (COUNT dimension — the messages[] array length is a hard upstream constraint that no byte/token estimate expresses, #5000: a 26,903-message session cleared every size gate and died at the upstream). Folding cannot close ~${gap.toLocaleString("en-US")} messages inside one preflight; reduce the session history — restart the session or rewind to an earlier point — and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false, count gate): ${countMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: countMessage, retryable: false, respond: !res.writableEnded };
         }
     }
     if (limit <= 0 || !model || !triggerFires) return prepared;
-    // #3846: an earlier local 413 for THIS origin+model at an equal or wider
-    // window is independent evidence the payload cannot fit here — the
-    // forward-once escapes below must not re-bet the estimator guess. Fitting
-    // payloads are unaffected (they never reach an escape hatch); another
-    // origin/model or a larger window judges fresh, exactly like the #1933 F2
-    // baseline demotion does.
-    const localRefusalHere = localRefusalCovers(session.metadata, currentOrigin, model, limit);
     // #2313: an estimate may not block the forward. The trigger above can
     // fire on the calibrated chars/4 estimate alone; when the current
     // upstream's billing scale diverges from the estimator's caliber
@@ -4065,67 +3982,17 @@ export async function preflightCompressIfNeeded(
     // request, so the #2313 estimate-only forward-once never skips it.
     const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
     if (probeForEvidence) {
-        // #2490: mathematically-doomed probe guard. The forward-once below bets
-        // one request on "the estimator might be wrong about size"; that bet has
-        // positive expected value only while SOME tokenizer could make the
-        // payload fit. Price the bet in UTF-8 BYTES of the core text against TWO
-        // bars — window×7.5 (densest live-route billing observed: ~6.8 B/token,
-        // #2122's calibrated shim) AND an absolute 2MB floor. The floor keeps
-        // synthetic-but-legal dense payloads probing (the #1001 rewrite test
-        // rides 86KB at 8.6 B/tok against a 10K window — repetitive text real
-        // tokenizers DO compress past 7.5 B/token): below 2MB the probe costs
-        // one small request and density assumptions deserve the benefit of the
-        // doubt; past it (incident #2490: a 7.5MB single assistant turn against
-        // a 1M window) forwarding "for evidence" is a guaranteed 400 with a
-        // multi-MB body, not an experiment — fail fast with the byte math so
-        // the operator can verify it by hand. Bytes, not chars: CJK monsters
-        // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
-        // fitting English payload sits ~4× under the ratio bar.
-        // #5000/#4543: this probe gate keeps the #2490 byte-floor contract
-        // (7.5 B/tok = the densest REAL billing observed, the most conservative
-        // density; the 2MB absolute keeps experiment-sized payloads probing —
-        // the #1001 shape, where real tokenizers compress past any byte-ratio
-        // bar, must stay able to bet one request and settle a usage baseline).
-        // A measured-token tier lives at the gates where a forward is
-        // arbitration of a body preflight already tried to shrink: the #1839
-        // forward-once arm below, the #3146/#4185 post-fold block further down,
-        // and the egress fuse in relay.ts. A probe that the local egress fuse
-        // would block cannot acquire upstream evidence: use the normal fold
-        // path instead, without recording a persistent route refusal.
-        const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
-        if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-            const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(prepared.processedMessages)}`);
-            const doomedMessage = `payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it, so it was NOT forwarded even for evidence. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-            // #2847: the rejection is mathematically deterministic, so the STATUS
-            // itself must carry the non-retryable semantics — a 502 says
-            // "transient gateway failure" to status-code-driven hosts and they
-            // retry the identical doomed payload anyway (field evidence: 3
-            // crashes in 10s, body `"retryable": false` notwithstanding; the
-            // 3rd attempt carried a 6.4MB payload after a representation flip).
-            // 413 mirrors the side-request guard's "cannot fit, NOT forwarded"
-            // convention and is terminal for every mainstream host. Same doom
-            // math, same message, same no-forward behavior — status only.
-            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
-        }
-        const declaredWindow = typeof session.metadata.effectiveContextLimit === "number" && session.metadata.effectiveContextLimit > 0
-            ? session.metadata.effectiveContextLimit : 0;
-        const probeMeasurement = declaredWindow > 0 && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD"
-            ? measuredOutbound(prepared) : undefined;
-        const probeBlockedByEgress = probeMeasurement !== undefined
-            && probeMeasurement.tokens > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
-        if (localRefusalHere) {
-            // #3846: bili already refused this scope locally — the estimate-only
-            // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
-            log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
-        } else if (probeBlockedByEgress) {
-            log("info", `[${session.id}] estimate-only probe would be refused by the local egress window fuse (~${Math.round(probeMeasurement!.tokens)} tokens); folding before forwarding instead of probing (#2313/#4079)`);
-        } else {
-            log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
-            return prepared;
-        }
+        // #2313: the trigger fired on the calibrated estimate alone; the current
+        // upstream's billing scale may diverge from the estimator's caliber.
+        // Forward once and let the upstream arbitrate size instead of folding
+        // first: success settles a usage baseline, a 4xx overflow arms one
+        // (armOverflowShrink stamps the evidence origin so the arm survives F2
+        // on this route). Either outcome re-arms honest metering.
+        // #7537: the local byte-floor doom was removed — the probe always
+        // forwards now; the upstream's real size error (with the provider's own
+        // numbers) is the authoritative verdict, not a local estimate.
+        log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
+        return prepared;
     }
     // #3146: judge fit on the calibrated CJK-aware estimate for EVERY regime —
     // the char-count bound (tokenCount) is the TRIGGER arm only. Judging fit on
@@ -4163,8 +4030,7 @@ export async function preflightCompressIfNeeded(
     // arbitration and let preflightCompress fold the text portion first, re-applying
     // this same forward-instead-of-fail-fast decision after compression (below).
     const imageArbitration = imageTokens > 0 && textChannel < limit && textChannel + imageTokens >= limit && noOverflowEvidence;
-    // #3846: a scoped local 413 outranks the image-arbitration bet too.
-    if (imageArbitration && !localRefusalHere && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
+    if (imageArbitration && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
         log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, nothing compressible, no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
         return prepared;
     }
@@ -4176,53 +4042,9 @@ export async function preflightCompressIfNeeded(
     // #869 review: quote the POST-FOLD size once folding happened — reporting
     // only the original tokenCount reads as "nothing happened" even when 16
     // folds removed hundreds of thousands of tokens. foldedTokens/rangesLeft
-    // stay undefined when no fold ran, so the original phrasing holds there.
-    let remainingImageTokens = imageTokens;
-    const failFast = (status: number, detail: string, retryable: boolean, foldedTokens?: number, rangesLeft?: number): PreflightFailFast => {
-        const imageNote = remainingImageTokens >= limit
-            ? ` Images alone account for ~${remainingImageTokens} estimated tokens (≥ window ${limit}); reduce the remaining image payload or raise the window.`
-            : "";
-        const sizeClause = foldedTokens !== undefined && foldedTokens < tokenCount
-            ? `context ~${foldedTokens} tokens (down from ~${tokenCount} before preflight) exceeds the model window ${limit}`
-            : `context ~${tokenCount} tokens exceeds the model window ${limit}`;
-        const rangesClause = rangesLeft !== undefined ? `, with ${rangesLeft} compressible range(s) still visible` : "";
-        // #736: when the wall is bili's own shrunken window, say so — "raise the
-        // model context window" otherwise sends operators to the upstream when
-        // their compress.modelContextLimit is the actual ceiling. Gate on
-        // windowShrinkReason (set ONLY by the operator-override and codex-align
-        // paths) — NOT just on limit < resolvedNativeWindow: the per-request
-        // output-headroom reservation (reserveOutputHeadroom) also lowers
-        // reqConfig.modelContextLimit below native for every turn whose route
-        // reserves headroom (non-anthropic wires plus anthropic routes lacking
-        // separate-output-budget evidence, #4205), so comparing alone would emit
-        // this note for a setting the operator never touched (#737 review).
-        const ffEmbeddedUrl = route?.rewrittenUrl;
-        const ffProviderKeys = Object.keys(opts.routes);
-        const shrinkNote = buildWindowShrinkNote({
-            reason: windowShrinkReason,
-            limit,
-            nativeWindow: resolvedNativeWindow,
-            routeMissedConfigured: ffProviderKeys.length > 0 && findRouteKey(opts.routes, ffEmbeddedUrl) === undefined,
-            upstreamEndpoint: ffEmbeddedUrl,
-            knownKeys: ffProviderKeys,
-        });
-        // #3146: when the size figure rests on bili's LOCAL estimate alone (no
-        // per-route calibration k̂, no usage/overflow-arm baseline), say so —
-        // presenting "~N tokens" as established fact misleads operators when the
-        // estimator diverges from upstream billing (#3146 read chars-as-tokens
-        // ~2x high). Rejections backed by real evidence keep today's wording.
-        const estimateOnly = baselineFloor === 0 && kFactor === undefined
-            && session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm";
-        const estimateNote = estimateOnly ? " (size judged by bili's local estimate, which can diverge from what the upstream actually bills)" : "";
-        const message =
-            `${sizeClause} (model=${model})${rangesClause}${estimateNote} ` +
-            `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
-            imageNote +
-            shrinkNote +
-            ` The over-window payload was NOT forwarded.`;
-        log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
-        return { failFast: true, status, message, retryable, respond: !res.writableEnded };
-    };
+    // #7537: the fail-fast helper and the local-estimation 413 rejections it
+    // served were removed — after folding, the payload is ALWAYS forwarded and
+    // the upstream's real size error is the authoritative verdict.
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
         // #3146: fit is judged on the CJK-aware estimate (payloadFitsWindow) for
@@ -4411,7 +4233,6 @@ export async function preflightCompressIfNeeded(
         const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
         const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
         const rebuiltImageTokens = imageReserveFor(session, rebuilt.protocol, rebuilt.body, opts, upstreamUrl);
-        remainingImageTokens = rebuiltImageTokens;
         reducedImageWire = result.compressedRanges > 0 && rebuiltImageTokens < imageTokens;
         if (rebuiltTextSize > session.stats.lastInputTokens) {
             session.stats.lastInputTokens = rebuiltTextSize;
@@ -4540,43 +4361,11 @@ export async function preflightCompressIfNeeded(
     } catch {
         outboundBudgetTokens = undefined;
     }
-    // #1839: the two measurements disagree — preflight's own final view
-    // (post-fold content + images + wire overhead) fits, but the fresh
-    // normal-config rebuild measures over. That divergence produced the
-    // self-contradictory fail-fast ("context ~44231 … exceeds window
-    // 253725"). Forward once and let the upstream arbitrate (the #496
-    // house pattern): a genuinely over-window payload is rejected once
-    // and armOverflowShrink recovers with real evidence; a fitting
-    // payload is no longer refused on a stale measurement. One forward
-    // only — the #330 relaxed-zone caveat still bounds the risk.
-    if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere) {
-        // #5000/#4543/#5885: the disagreement above is between two ESTIMATES — a
-        // MEASURED body is authoritative. If the rebuilt body itself exceeds the
-        // window on the #554 meter, "forwarding once for arbitration" is a
-        // guaranteed 400 (#4543: a 4.1 MiB CJK body measuring 1,121,674 tokens
-        // against a 1M window) and the log's "NOT forwarded" claim would be a
-        // lie (#5885 defect 3) — answer it 413 instead of burning the send.
-        // Bar: the NATIVE window when bili knows it (a body over the upstream's
-        // real window can never fit, on any tokenizer), the headroom limit as
-        // fallback — a meter over-count against the POLICY headroom must not
-        // swallow the #1839/#4185 "fits the native window" forwards.
-        // Images are NOT part of this comparison: an image-dominated overage is
-        // the #496/#1800 billing-arbitration domain (forward, let upstream bill
-        // or 400 for real evidence), not a doom — #857's screenshot turn pins
-        // that. The #554 meter excludes image payloads (image_url/data/url/...),
-        // so `outboundRawTokens` is text-only by construction.
-        const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
-            const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
-            log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
-            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
-        }
-        log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
-        return outbound;
-    }
+    // #7537: the #1839 measured-body doom was removed — after folding, the
+    // payload is ALWAYS forwarded and the upstream's real size error (with the
+    // provider's own numbers) is the authoritative verdict, not a local
+    // measured-token estimate. The auto-fold / image-arbitration logging below
+    // still runs; every path now forwards.
     // [#autoFold] fail-fast is an OVERFLOW concept: a growth-armed payload
     // fits the real window by definition, so a fold that could not reach the
     // lean target forwards anyway — the session stays functional and the
@@ -4608,7 +4397,7 @@ export async function preflightCompressIfNeeded(
     // portion was already folded above when foldable; we do NOT re-loop.
     const imageArbitrationAfterFold = reducedImageWire && resolveImageBilling(opts.imageBilling, upstreamUrl) === "pixels"
         && session.stats.lastInputTokensSource !== "overflow-arm";
-    if ((imageArbitration || imageArbitrationAfterFold) && !localRefusalHere) {
+    if (imageArbitration || imageArbitrationAfterFold) {
         // Same fallback as the fit-gate measurement above: processedMessages
         // empty ⇒ kernel transform failure ⇒ the raw body rides.
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
@@ -4619,126 +4408,24 @@ export async function preflightCompressIfNeeded(
             return outbound;
         }
     }
-    // #3146: a FRESH (unknown-baseline) session that still measures over-window
-    // by the calibrated CJK-aware estimate after maximum folding holds NO upstream
-    // evidence either way — the local estimate may undershoot (dense content) or
-    // overshoot, exactly like the estimate-only meter the #2313 probe refuses to
-    // trust. Forward once and let the upstream arbitrate the size (the #496/#1839/
-    // #2313 house pattern): success settles a usage baseline, a 4xx overflow arms
-    // one (armOverflowShrink), and honest metering + fail-fast resume from the next
-    // request. A mathematically-doomed body (#2490 byte math on the POST-FOLD
-    // payload) fails fast with 413 instead of burning a multi-MB guaranteed-400
-    // forward. This replaces the old char-count reject-forward gate, which
-    // fail-fasted a successfully-folded payload that actually fit (#3146).
-    // #4185: the gate above keyed on unknownBaseline, whose `anonymous &&`
-    // (#553 trigger-side concern) excluded IDENTIFIED fresh sessions — the
-    // dsh/codex/claude-code lanes stamp their own session ids, so their first
-    // over-headroom request skipped this gate and hit the final fail-fast;
-    // #3846 pinned every retry and the session was dead from message one
-    // (2026-10-21 raccoon incident: ~227K est vs the 192001 headroom target
-    // while payload + clamped output budget fit the 256000 native window).
-    // Two more arms, same internals: noUpstreamEvidence extends "zero
-    // evidence → arbitrate" to identified fresh sessions — but only for a
-    // DETERMINISTIC exhaustion (zero compressible ranges after maximum
-    // folding, #4185's shape): a relay-dependent failure (transient summary
-    // 503/429/524, empty or truncated summaries) keeps the classic 502
-    // fail-fast, because the walk may succeed once the relay recovers and
-    // forwarding an over-window payload then would only hammer the upstream
-    // (#301/#726). nativeFitAfterClamp forwards whenever the OUTBOUND body
-    // (already #453/#2096-clamped in prepare) plus its declared output budget
-    // fits the NATIVE window — the headroom reservation is a policy
-    // preference, not a physical limit, and with nothing left to fold the
-    // choice is a smaller output budget vs a dead session. statedWall > 0
-    // (the upstream already stated its overflow wall on record) keeps the
-    // native-fit arm closed; doom bytes (#2490) and #3846 guard every arm.
-    const deterministicExhaustion = f?.kind === "exhausted" && f.deterministic;
-    const noUpstreamEvidence = session.stats.lastInputTokens <= 0 && statedWall <= 0 && deterministicExhaustion;
-    const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
-    const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
-        && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
-    if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
-        const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
-        // #5000/#4543: the measured body is the stronger reading — if it exceeds
-        // the window no upstream can accept it, whatever the byte floor says
-        // (the floor only sees m.text; #5000's 55.2 MiB wire body and #4543's
-        // 4.1 MiB CJK body both cleared it). Same bar as the #1839 arm above:
-        // the native window when known (a #4185 headroom over-count must not
-        // false-refuse a natively-fitting body), the headroom limit as
-        // fallback. Measured tier first, byte floor below stays as the
-        // fallback for unparseable bodies.
-        // Same text-only rule as the #1839 arm above: image-dominated overage
-        // belongs to the #496/#1800 billing arbitration, never to a local doom.
-        const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
-            log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
-            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
-        }
-        const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
-        if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
-            const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
-            log("error", `[${session.id}] preflight 413 core-text profile: ${describeCoreTextDuplication(outMsgs)}`);
-            const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
-            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
-        }
-        if (localRefusalHere) {
-            // #3846: bili already refused this scope locally — do not re-bet on
-            // the estimator; fall through to the fail-fast below.
-            log("warn", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for size arbitration (#3846/#4185)`);
-        } else {
-            const viaNativeFit = nativeFitAfterClamp && !noUpstreamEvidence && !unknownBaseline;
-            log("info", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) ${viaNativeFit ? `but the outbound view (~${Math.round(outboundCalibrated)} tok) + clamped output budget ${outboundBudgetTokens ?? 0} fits the native window ${resolvedNativeWindow}` : "with no upstream evidence"} — forwarding once for the upstream to arbitrate size before failing fast (#3146/#4185)`);
-            return outbound;
-        }
+    // #7537: the payload still overflows the window by local estimate after
+    // maximum folding. The local-estimation 413 rejections (#3146/#4185
+    // measured-body doom, #2490 byte-floor doom, #3846 local-refusal memory)
+    // were all removed — after folding, the payload is ALWAYS forwarded and
+    // the upstream's real size error (with the provider's own numbers) is the
+    // authoritative verdict. Log local measured evidence for the operator and
+    // forward.
+    {
+        const evidenceParts = [
+            `inboundBytes=${Buffer.byteLength(inboundBody, "utf8")}`,
+            `postFoldMeasured=${outboundRawTokens !== undefined ? outboundRawTokens.toLocaleString("en-US") + " tokens" : "unmeasured"}`,
+            `window=${limit}`,
+            `foldRounds=${result.compressedRanges}`,
+        ];
+        if (outboundBreakdown) evidenceParts.push(`breakdown=${measuredBreakdownClause(outboundBreakdown)}`);
+        log("warn", `[${session.id}] payload over window ${limit} by local estimate after preflight compression — forwarding for upstream arbitration (#7537): ${evidenceParts.join(", ")}`);
     }
-    // The payload still overflows the window: fail fast with a diagnostic
-    // error instead of forwarding a guaranteed-400 payload (#301).
-    // #3461 problem 2: DETERMINISTIC exhaustion (futile-round math proved no
-    // combination of folds can close the gap regardless of upstream health)
-    // can never succeed for this identical payload — answer it 413 like every
-    // other "can never fit as-is" verdict (#2847 lesson applied to the
-    // exhaustion path; #2921/#3146 doomed-bytes precedent) instead of 502,
-    // which status-code-driven headless hosts read as transient and spin on
-    // forever (field measurement: 5+ doomed rounds). Relay-dependent
-    // exhaustion (empty/truncated/incomplete summaries, budget draws, pool
-    // saturation) stays 502: those walks succeed once the relay recovers.
-    // AND only when bili's own calibrated meter agrees the payload is over the
-    // window (!payloadFitsWindow): when the calibrated estimate FITS but the
-    // walk still ran (char-count trigger arm, overflow-armed baseline), the
-    // doom is a relay-billing artifact bili cannot compute (#496/#767/#857
-    // byte-relay lanes) — bili must not declare structural doom for it; those
-    // lanes keep their 502 fail-fast contract where NOT re-forwarding IS the
-    // protection, not a client spin.
-    const status = f?.kind === "upstream" && f.status === 429 ? 503 : f?.kind === "exhausted" && f.deterministic && !payloadFitsWindow ? 413 : 502;
-    // #3918: non-deterministic exhaustion WITH committed progress is not terminal —
-    // the folds persist in the session, so the next attempt starts from a smaller
-    // baseline and continues the fold. Reporting retryable=false told hosts to stop
-    // spinning exactly where each retry makes real progress (incident: 64 effective
-    // folds, every round declared terminal). Deterministic exhaustion keeps today's
-    // verdict: nothing more can fold from this view, so retries are genuinely doomed.
-    const progressContinues = f?.kind === "exhausted" && !f.deterministic && result.compressedRanges > 0;
-    // #3846: a deterministic can-never-fit verdict is local refusal evidence for
-    // this scope — persist it so the forward-once escapes above stay closed on
-    // retry even after the baseline demotes to estimate or the body changes.
-    if (status === 413) noteLocalRefusal(session, currentOrigin, model, limit);
-    // #2189: an explicit retryable=false from preflight (credential-shape
-    // rejection — deterministic for the identical payload) overrides the
-    // status-based heuristic below; every other path keeps today's mapping.
-    const retryable = progressContinues ? true : f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
-    let ffDetail = f?.detail ?? "the payload still exceeds the window after preflight compression";
-    if (progressContinues) {
-        const shortfall = foldedCalibratedSize !== undefined ? Math.max(0, limit - foldedCalibratedSize) : undefined;
-        ffDetail += ` ${result.compressedRanges} range(s) folded this turn persist in the session — the next attempt starts from a smaller baseline and continues the fold${shortfall !== undefined ? ` (~${shortfall.toLocaleString("en-US")} tokens short of the target)` : ""}.`;
-    }
-    const ff = failFast(status, ffDetail, retryable, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
-    // (#4079) the #726 dead-end cooldown arming was removed with the whole
-    // mechanism — see the block comment where the walk starts. The retry
-    // contract lives entirely in this answer's retryable:false/status.
-    return ff;
+    return outbound;
 }
 
 // Host-injected contextual user fragments: machine-generated context sent as
